@@ -170,3 +170,158 @@ sureg() {
 nseg(n) {
     return ((n+127) >> 7); // 128로 나누어 올림
 }
+
+
+#include "../param.h"    // 시스템 매개변수를 정의하는 헤더 파일
+#include "../user.h"     // 사용자 관련 데이터 구조 및 매크로
+#include "../proc.h"     // 프로세스 관리 데이터 구조 정의
+#include "../text.h"     // 텍스트 세그먼트 관리 데이터 구조
+#include "../systm.h"    // 시스템 전역 변수 및 함수 정의
+#include "../file.h"     // 파일 관련 데이터 구조 정의
+#include "../inode.h"    // 파일 시스템 아이노드 구조
+#include "../buf.h"      // 버퍼 관리 데이터 구조
+
+/*
+ * 새로운 프로세스를 생성하는 함수입니다.
+ * 내부적으로 `sys fork`를 처리하며, 새로 생성된 프로세스는 1을 반환합니다.
+ */
+newproc() {
+    int a1, a2;                     // 새로운 프로세스의 주소 관련 변수
+    struct proc *p, *up;            // 프로세스 구조체 포인터
+    register struct proc *rpp;      // 현재 처리 중인 프로세스
+    register *rip, n;               // 레지스터 변수
+
+    p = NULL;                       // 새로운 프로세스 슬롯 초기화
+retry:
+    mpid++;                         // 프로세스 ID 증가
+    if (mpid < 0) {                 // 프로세스 ID가 음수일 경우 초기화
+        mpid = 0;
+        goto retry;
+    }
+    for (rpp = &proc[0]; rpp < &proc[NPROC]; rpp++) {
+        if (rpp->p_stat == NULL && p == NULL) // 빈 슬롯 찾기
+            p = rpp;
+        if (rpp->p_pid == mpid)              // 중복된 PID 확인
+            goto retry;
+    }
+    if ((rpp = p) == NULL)                   // 빈 슬롯이 없으면 패닉
+        panic("no procs");
+
+    rip = u.u_procp;               // 현재 프로세스
+    up = rip;
+    rpp->p_stat = SRUN;            // 새 프로세스 상태: 실행 대기 중
+    rpp->p_flag = SLOAD;           // 메모리에 로드됨
+    rpp->p_uid = rip->p_uid;       // 사용자 ID 복사
+    rpp->p_ttyp = rip->p_ttyp;     // 터미널 정보 복사
+    rpp->p_nice = rip->p_nice;     // 우선순위 복사
+    rpp->p_textp = rip->p_textp;   // 텍스트 세그먼트 복사
+    rpp->p_pid = mpid;             // 새 프로세스 ID 설정
+    rpp->p_ppid = rip->p_pid;      // 부모 프로세스 ID 설정
+    rpp->p_time = 0;               // 실행 시간 초기화
+
+    for (rip = &u.u_ofile[0]; rip < &u.u_ofile[NOFILE];)
+        if ((rpp = *rip++) != NULL)
+            rpp->f_count++;        // 열린 파일 참조 카운트 증가
+    if ((rpp = up->p_textp) != NULL) {
+        rpp->x_count++;            // 텍스트 세그먼트 참조 카운트 증가
+        rpp->x_ccount++;
+    }
+    u.u_cdir->i_count++;           // 현재 디렉토리 참조 카운트 증가
+
+    savu(u.u_rsav);                // 현재 프로세스 상태 저장
+    rpp = p;                       // 새로운 프로세스로 설정
+    u.u_procp = rpp;
+    rip = up;
+    n = rip->p_size;               // 프로세스 크기 복사
+    a1 = rip->p_addr;              // 현재 프로세스 주소 복사
+    rpp->p_size = n;               // 새로운 프로세스 크기 설정
+    a2 = malloc(coremap, n);       // 메모리 할당
+
+    if (a2 == NULL) {              // 메모리가 부족할 경우
+        rip->p_stat = SIDL;        // 프로세스 상태: 생성 중
+        rpp->p_addr = a1;          // 기존 주소 복사
+        savu(u.u_ssav);            // 스택 상태 저장
+        xswap(rpp, 0, 0);          // 프로세스 스왑 아웃
+        rpp->p_flag |= SSWAP;      // 스왑 상태 플래그 설정
+        rip->p_stat = SRUN;        // 프로세스 상태: 실행 대기 중
+    } else {
+        rpp->p_addr = a2;          // 새로운 주소 설정
+        while (n--)
+            copyseg(a1++, a2++);   // 세그먼트 복사
+    }
+    u.u_procp = rip;               // 현재 프로세스로 복원
+    return(0);                     // 정상 종료
+}
+
+/*
+ * 스케줄링 메인 루프.
+ * 실행 준비된 프로세스를 찾고, 스왑 인/아웃을 통해 메모리를 관리합니다.
+ */
+sched() {
+    struct proc *p1;                // 선택된 프로세스
+    register struct proc *rp;       // 현재 프로세스
+    register a, n;
+
+loop:
+    spl6();                         // 인터럽트 우선순위 설정
+    n = -1;
+    for (rp = &proc[0]; rp < &proc[NPROC]; rp++)
+        if (rp->p_stat == SRUN && (rp->p_flag & SLOAD) == 0 &&
+            rp->p_time > n) {       // 가장 오래된 실행 대기 프로세스 선택
+            p1 = rp;
+            n = rp->p_time;
+        }
+    if (n == -1) {                  // 실행 가능한 프로세스가 없으면
+        runout++;
+        sleep(&runout, PSWP);       // 스왑 상태에서 대기
+        goto loop;
+    }
+
+found2:
+    rp = p1;
+    a = rp->p_size;                 // 필요한 메모리 크기
+    if ((a = malloc(coremap, a)) != NULL) {
+        rp->p_addr = a;             // 메모리 주소 설정
+        rp->p_flag |= SLOAD;        // 메모리에 로드됨
+        rp->p_time = 0;             // 대기 시간 초기화
+    } else {
+        panic("swap error");        // 스왑 에러 처리
+    }
+    goto loop;                      // 다시 스케줄링 루프로 돌아감
+}
+
+/*
+ * 프로세스의 데이터+스택 영역 크기를 변경합니다.
+ * 크기가 줄어들 경우 메모리를 해제합니다.
+ * 크기가 늘어나면 메모리를 할당하고 데이터를 복사합니다.
+ */
+expand(newsize) {
+    int i, n;
+    register *p, a1, a2;
+
+    p = u.u_procp;                  // 현재 프로세스
+    n = p->p_size;                  // 기존 크기
+    p->p_size = newsize;            // 새로운 크기 설정
+    a1 = p->p_addr;                 // 기존 주소
+
+    if (n >= newsize) {             // 크기 축소
+        mfree(coremap, n - newsize, a1 + newsize);
+        return;
+    }
+
+    savu(u.u_rsav);                 // 현재 상태 저장
+    a2 = malloc(coremap, newsize);  // 메모리 할당
+    if (a2 == NULL) {               // 메모리 부족 시
+        savu(u.u_ssav);             // 스택 상태 저장
+        xswap(p, 1, n);             // 프로세스 스왑 아웃
+        p->p_flag |= SSWAP;         // 스왑 플래그 설정
+        swtch();                    // 스위치 호출 (재개 없음)
+    }
+
+    p->p_addr = a2;                 // 새로운 주소 설정
+    for (i = 0; i < n; i++)         // 기존 데이터 복사
+        copyseg(a1 + i, a2++);
+    mfree(coremap, n, a1);          // 기존 메모리 해제
+    retu(p->p_addr);                // 프로세스 메모리 주소 갱신
+    sureg();                        // 세그먼트 설정 업데이트
+}
