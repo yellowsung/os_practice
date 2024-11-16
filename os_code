@@ -1,0 +1,172 @@
+#include "../param.h"    // 시스템 매개변수를 정의하는 헤더 파일
+#include "../user.h"     // 사용자 관련 데이터 구조 및 매크로
+#include "../systm.h"    // 시스템 전역 변수 및 함수 정의
+#include "../proc.h"     // 프로세스 관리 관련 데이터 구조
+#include "../text.h"     // 텍스트 세그먼트 관리 데이터 구조
+#include "../inode.h"    // 파일 시스템 아이노드 구조
+#include "../seg.h"      // 메모리 세그먼트 관리 헤더 파일
+
+#define CLOCK1  0177546  // 첫 번째 클럭 장치의 하드웨어 주소
+#define CLOCK2  0172540  // 두 번째 클럭 장치의 하드웨어 주소
+
+/*
+ * icode는 사용자 모드에서 실행되는 초기 부트스트랩 프로그램입니다.
+ * 시스템 초기화를 위해 /etc/init을 실행합니다.
+ */
+int icode[] {
+    0104413,        /* sys exec; init; initp - 시스템 호출로 init 실행 */
+    0000014,        /* initp의 주소를 설정 */
+    0000010,        /* 빈 데이터 */
+    0000777,        /* 무한 루프 (br .) */
+    0000014,        /* initp: init; 0 */
+    0000000,        /* 초기화된 데이터 0 */
+    0062457,        /* init 문자열 "/etc/init" */
+    0061564,
+    0064457,
+    0064556,
+    0000164,
+};
+
+/*
+ * main() 함수는 시스템 초기화를 담당합니다.
+ * 메모리 초기화, 클럭 확인, 루트 디렉토리 설정, 프로세스 생성 등이 포함됩니다.
+ */
+main() {
+    extern schar;          // 외부 변수 schar 선언
+    register i, *p;        // i와 p는 레지스터 변수
+
+    /*
+     * 메모리 초기화
+     * coremap과 UISD, UISA를 사용해 가용 메모리를 계산하고 초기화합니다.
+     */
+    updlock = 0;           // 업데이트 잠금을 해제
+    i = *ka6 + USIZE;      // 첫 번째 사용자 세그먼트 주소 설정
+    UISD->r[0] = 077406;   // 세그먼트 크기 설정 (읽기-쓰기)
+    for (;;) {
+        UISA->r[0] = i;    // 사용자 주소 설정
+        if (fuibyte(0) < 0) // 0 주소 확인 (가용 메모리 끝 확인)
+            break;
+        clearseg(i);       // 세그먼트 초기화
+        maxmem++;          // 가용 메모리 증가
+        mfree(coremap, 1, i); // 메모리를 coremap에 추가
+        i++;
+    }
+
+    /*
+     * 클럭 장치 확인
+     * CLOCK1을 확인하고, 동작하지 않으면 CLOCK2를 확인합니다.
+     */
+    lks = CLOCK1;
+    if (fuiword(lks) == -1) {    // CLOCK1이 유효하지 않은 경우
+        lks = CLOCK2;            // CLOCK2를 선택
+        if (fuiword(lks) == -1)  // 둘 다 실패하면
+            panic("no clock");   // 시스템 초기화 중단
+    }
+
+    /*
+     * 루트 디렉토리 설정
+     * 루트 디렉토리와 현재 디렉토리의 i-node를 가져옵니다.
+     */
+    rootdir = iget(rootdev, ROOTINO);  // 루트 디바이스의 루트 i-node 가져오기
+    rootdir->i_flag =& ~ILOCK;         // i-node 잠금 해제
+    u.u_cdir = iget(rootdev, ROOTINO); // 현재 디렉토리 설정
+    u.u_cdir->i_flag =& ~ILOCK;        // i-node 잠금 해제
+
+    /*
+     * 새로운 프로세스를 생성하고 부트스트랩 코드를 복사한 뒤 실행
+     */
+    if (newproc()) {              // 새로운 프로세스를 생성
+        expand(USIZE+1);          // 메모리 공간 확장
+        estabur(0, 1, 0, 0);      // 사용자 세그먼트 설정
+        copyout(icode, 0, sizeof icode); // 부트스트랩 코드 복사
+        return;                   // 새 프로세스 실행
+    }
+    sched();                      // 스케줄러 호출
+}
+
+/*
+ * estabur 함수는 텍스트, 데이터, 스택 세그먼트를 설정합니다.
+ * sep 매개변수로 세그먼트를 분리할지 여부를 결정합니다.
+ */
+estabur(nt, nd, ns, sep) {
+    register a, *ap, *dp;
+
+    // 세그먼트 크기 확인 및 에러 처리
+    if (sep) {
+        if (cputype == 40 || nseg(nt) > 8 || nseg(nd)+nseg(ns) > 8)
+            goto err;
+    } else {
+        if (nseg(nt)+nseg(nd)+nseg(ns) > 8)
+            goto err;
+    }
+    if (nt + nd + ns + USIZE > maxmem)
+        goto err;
+
+    // 텍스트 세그먼트 설정
+    a = 0;
+    ap = &u.u_uisa[0];
+    dp = &u.u_uisd[0];
+    while (nt >= 128) {
+        *dp++ = (127<<8) | RO; // 읽기 전용
+        *ap++ = a;
+        a += 128;
+        nt -= 128;
+    }
+    if (nt) {
+        *dp++ = ((nt-1)<<8) | RO;
+        *ap++ = a;
+    }
+
+    // 데이터 세그먼트 설정
+    a = USIZE;
+    while (nd >= 128) {
+        *dp++ = (127<<8) | RW; // 읽기-쓰기
+        *ap++ = a;
+        a += 128;
+        nd -= 128;
+    }
+    if (nd) {
+        *dp++ = ((nd-1)<<8) | RW;
+        *ap++ = a;
+    }
+
+    // 스택 세그먼트 설정
+    a += ns;
+    while (ns >= 128) {
+        a -= 128;
+        ns -= 128;
+        *--dp = (127<<8) | RW;
+        *--ap = a;
+    }
+    if (ns) {
+        *--dp = ((128-ns)<<8) | RW | ED; // 확장 가능
+        *--ap = a-128;
+    }
+
+    sureg(); // 하드웨어 세그먼트 설정
+    return(0);
+
+err:
+    u.u_error = ENOMEM; // 메모리 부족 에러
+    return(-1);
+}
+
+/*
+ * sureg 함수는 소프트웨어 세그먼트를 하드웨어 레지스터에 복사합니다.
+ */
+sureg() {
+    register *up, *rp, a;
+
+    a = u.u_procp->p_addr; // 프로세스 시작 주소
+    up = &u.u_uisa[16];    // 사용자 주소 시작
+    rp = &UISA->r[16];     // 하드웨어 주소 시작
+    while (rp > &UISA->r[0])
+        *--rp = *--up + a; // 주소 복사
+}
+
+/*
+ * nseg 함수는 세그먼트를 128 단위로 나누어 올림 처리합니다.
+ */
+nseg(n) {
+    return ((n+127) >> 7); // 128로 나누어 올림
+}
